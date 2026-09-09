@@ -1,0 +1,1474 @@
+URL SHORTENER / BITLY — SYSTEM DESIGN + CODING NOTES
+=============================================================
+
+This file contains the complete notes we discussed for designing and coding
+a beginner-to-intermediate URL shortener like Bitly.
+
+=============================================================
+1. WHAT IS A URL SHORTENER?
+=============================================================
+
+A URL shortener converts a long URL into a short, manageable URL.
+
+Example:
+
+Long URL:
+https://www.example.com/some/very/long/url
+
+Short URL:
+https://short.ly/abc123
+
+When a user opens the short URL, the system finds the original URL and
+redirects the user to it.
+
+The two most important operations are:
+
+1. Create a short URL
+2. Redirect a short URL to the original URL
+
+
+=============================================================
+2. FUNCTIONAL REQUIREMENTS
+=============================================================
+
+Functional requirements describe WHAT the system should do.
+
+CORE REQUIREMENTS:
+
+1. Users should be able to submit a long URL and receive a shortened URL.
+
+   Optional:
+   - Custom alias
+   - Expiration date
+
+2. Users should be able to access the original URL by using the shortened URL.
+
+Example:
+
+POST /urls
+
+Request:
+{
+    "long_url": "https://www.example.com/very/long/url",
+    "custom_alias": "my-link",
+    "expiration_date": "2027-01-01"
+}
+
+Response:
+{
+    "short_url": "https://short.ly/my-link"
+}
+
+
+OUT OF SCOPE FOR THE BASIC DESIGN:
+
+- User authentication
+- Account management
+- Click analytics
+- Geographic analytics
+- Advanced spam/malicious URL detection
+
+
+=============================================================
+3. NON-FUNCTIONAL REQUIREMENTS
+=============================================================
+
+Non-functional requirements describe HOW WELL the system should work.
+
+1. UNIQUE SHORT CODES
+
+Every short code should uniquely identify exactly one URL.
+
+Example:
+
+abc123 -> youtube.com/video1
+xyz789 -> google.com
+
+NOT:
+
+abc123 -> youtube.com/video1
+abc123 -> google.com
+
+
+2. LOW LATENCY
+
+Redirection should be very fast.
+
+Target:
+< 100 ms
+
+Because users frequently access short URLs, reads are extremely important.
+
+
+3. HIGH AVAILABILITY
+
+Target:
+99.99% availability.
+
+For this system, availability is generally more important than perfect
+real-time consistency for less critical data.
+
+However, correctness such as short-code uniqueness must still be guaranteed.
+
+
+4. SCALABILITY
+
+The design should be able to support approximately:
+
+- 1 billion shortened URLs
+- 100 million daily active users
+
+
+5. READ-HEAVY SYSTEM
+
+URL shorteners have many more reads than writes.
+
+Example:
+
+Approximately:
+1000 redirects (reads)
+for
+1 URL creation (write)
+
+Therefore the architecture should optimize heavily for reads.
+
+This is why caching is important.
+
+
+=============================================================
+4. CORE ENTITIES
+=============================================================
+
+At a high level, the main entities are:
+
+1. Original URL
+2. Short URL
+3. User
+
+Initially, we don't need every database column. We identify the main entities
+first and define the detailed data model later.
+
+
+=============================================================
+5. API DESIGN
+=============================================================
+
+REST APIs are used.
+
+Common HTTP methods:
+
+POST   -> Create
+GET    -> Read
+PUT    -> Update
+DELETE -> Delete
+
+
+CREATE SHORT URL:
+
+POST /urls
+
+Request:
+
+{
+    "long_url": "https://www.example.com/some/very/long/url",
+    "custom_alias": "optional_alias",
+    "expiration_date": "optional_expiration_date"
+}
+
+Response:
+
+{
+    "short_url": "http://short.ly/abc123"
+}
+
+
+REDIRECT:
+
+GET /{short_code}
+
+Example:
+
+GET /abc123
+
+Response:
+
+HTTP 302 Redirect
+Location: https://www.example.com/...
+
+
+=============================================================
+6. BASIC HIGH-LEVEL DESIGN
+=============================================================
+
+The simplest version is:
+
+Client
+  |
+  v
+Primary Server
+  |
+  v
+Database
+
+
+CREATE FLOW:
+
+Client
+  |
+  | POST /urls
+  v
+Primary Server
+  |
+  | 1. Validate URL
+  | 2. Generate short code
+  | 3. Save mapping
+  v
+Database
+  |
+  v
+Return short URL
+
+
+REDIRECT FLOW:
+
+Browser
+  |
+  | GET /abc123
+  v
+Primary Server
+  |
+  | Look up abc123
+  v
+Database
+  |
+  v
+Original URL
+  |
+  v
+HTTP 302 Redirect
+
+
+=============================================================
+7. DATABASE DATA MODEL
+=============================================================
+
+A URL record can contain:
+
+- id
+- short_code
+- original_url
+- creation_time
+- expiration_time
+- created_by
+
+Example:
+
+short_code | original_url              | expiration_time
+------------------------------------------------------------
+abc123     | https://youtube.com/...  | NULL
+xyz789     | https://google.com/...    | 2027-01-01
+
+
+IMPORTANT:
+
+short_code should have a UNIQUE constraint.
+
+Example PostgreSQL:
+
+CREATE TABLE urls (
+    id BIGSERIAL PRIMARY KEY,
+    short_code VARCHAR(20) UNIQUE NOT NULL,
+    original_url TEXT NOT NULL,
+    creation_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    expiration_time TIMESTAMP NULL,
+    created_by VARCHAR(100)
+);
+
+
+=============================================================
+8. CREATE SHORT URL — DETAILED FLOW
+=============================================================
+
+User sends:
+
+POST /urls
+
+with:
+
+{
+    "long_url": "https://youtube.com/very/long/url"
+}
+
+The server:
+
+1. Validates the URL.
+2. Checks if a custom alias was provided.
+3. Generates a short code if no custom alias exists.
+4. Stores the mapping in the database.
+5. Returns the short URL.
+
+
+CUSTOM ALIAS:
+
+If user provides:
+
+"custom_alias": "myvideo"
+
+The short URL becomes:
+
+short.ly/myvideo
+
+Before saving, check whether "myvideo" already exists.
+
+If it exists:
+Return a conflict/error.
+
+If it does not exist:
+Create the URL.
+
+
+OPTIONAL DEDUPLICATION:
+
+We could check whether the exact long URL already exists.
+
+However, most URL shorteners may allow multiple short codes for the same
+long URL because different users may want:
+
+- Different expiration dates
+- Different aliases
+- Independent analytics
+
+So deduplication is optional.
+
+
+=============================================================
+9. REDIRECTION — DETAILED FLOW
+=============================================================
+
+User opens:
+
+https://short.ly/abc123
+
+Browser sends:
+
+GET /abc123
+
+Server:
+
+1. Looks up abc123.
+2. Checks whether the URL exists.
+3. Checks expiration.
+4. If expired, returns 410 Gone.
+5. Otherwise returns a redirect response.
+
+
+EXPIRED URL:
+
+GET /abc123
+       |
+       v
+URL expired
+       |
+       v
+410 Gone
+
+
+ACTIVE URL:
+
+GET /abc123
+       |
+       v
+Find original URL
+       |
+       v
+302 Redirect
+       |
+       v
+Original URL
+
+
+=============================================================
+10. 301 VS 302 REDIRECT
+=============================================================
+
+301 = Moved Permanently
+
+Example:
+
+HTTP/1.1 301 Moved Permanently
+Location: https://www.original-url.com
+
+
+Browsers can cache a permanent redirect.
+
+This can be a problem if we later want to:
+- Change the destination
+- Expire the short URL
+- Delete the short URL
+- Control redirect behavior
+
+
+302 = Found / Temporary Redirect
+
+Example:
+
+HTTP/1.1 302 Found
+Location: https://www.original-url.com
+
+
+For this design, 302 is generally preferred because it gives the server
+more control over future requests.
+
+It also makes it easier to:
+- Handle expiration
+- Change redirect behavior
+- Track clicks later
+
+
+=============================================================
+11. SHORT CODE GENERATION
+=============================================================
+
+We need to satisfy three requirements:
+
+1. Short codes must be unique.
+2. Short codes should be short.
+3. Codes should be generated efficiently.
+
+
+-------------------------------------------------------------
+APPROACH 1: USE URL PREFIX
+-------------------------------------------------------------
+
+Example:
+
+Original:
+www.linkedin.com/in/some-user
+
+Take first 8 characters:
+
+www.link
+
+Problem:
+
+Many URLs can have the same prefix.
+
+Therefore this does NOT guarantee uniqueness.
+
+NOT RECOMMENDED.
+
+
+-------------------------------------------------------------
+APPROACH 2: RANDOM NUMBER
+-------------------------------------------------------------
+
+Generate a random number for every URL.
+
+Example:
+
+URL -> random number -> abc123
+
+Problem:
+
+Random generation does not guarantee uniqueness.
+
+At large scale, collisions can occur.
+
+Collision:
+
+URL A -> abc123
+URL B -> abc123
+
+We would need to check the database and retry.
+
+
+-------------------------------------------------------------
+APPROACH 3: HASH + BASE62
+-------------------------------------------------------------
+
+Hash the URL.
+
+Example:
+
+Long URL
+   |
+   v
+Hash function
+   |
+   v
+Hash value
+   |
+   v
+Base62
+   |
+   v
+Short code
+
+
+Hash functions are deterministic.
+
+The same input gives the same hash.
+
+A secret salt/nonce/HMAC can be used if we don't want predictable
+deterministic outputs.
+
+
+BASE62:
+
+Base62 uses:
+
+a-z = 26
+A-Z = 26
+0-9 = 10
+
+Total = 62 characters.
+
+Why Base62 instead of Base64?
+
+Base64 includes characters such as:
+
++
+/
+
+These can cause URL/path/query-string issues.
+
+Base62 is therefore convenient for URL short codes.
+
+
+Example:
+
+hash_code = hash_function(canonical_url)
+short_code_encoded = base62_encode(hash_code)
+short_code = first 8 characters
+
+
+8 characters gives:
+
+62^8 ≈ 218 trillion possible combinations.
+
+
+HASH COLLISION:
+
+Even with hashing, collisions are possible.
+
+Therefore:
+
+- Put UNIQUE constraint on short_code.
+- If insertion fails because of a collision, retry.
+- A different salt/nonce can be used for another attempt.
+
+
+TRADEOFF:
+
+More entropy
+    -> fewer collisions
+    -> potentially longer code
+
+Shorter code
+    -> smaller code space
+    -> more collision probability
+
+
+-------------------------------------------------------------
+APPROACH 4: COUNTER + BASE62
+-------------------------------------------------------------
+
+Another approach is to use a unique counter.
+
+Example:
+
+URL 1 -> counter 1
+URL 2 -> counter 2
+URL 3 -> counter 3
+URL 4 -> counter 4
+
+Then encode the number using Base62.
+
+Example:
+
+counter
+   |
+   v
+Base62
+   |
+   v
+short code
+
+
+This gives uniqueness because each counter value is unique.
+
+
+WHY REDIS?
+
+If there are multiple write servers:
+
+Write Server 1 ---\
+Write Server 2 ----> Redis Counter
+Write Server 3 ---/
+
+
+Redis supports atomic INCR.
+
+Example:
+
+Server 1 -> INCR -> 1000
+Server 2 -> INCR -> 1001
+Server 3 -> INCR -> 1002
+
+Each server gets a different value.
+
+Therefore Redis is useful for a shared global counter.
+
+
+ADVANTAGES:
+
+- No collision checking for generated counter values.
+- Efficient.
+- Easy to Base62 encode.
+- Works across multiple write servers with centralized coordination.
+
+
+DISADVANTAGES:
+
+1. Centralized counter requires coordination.
+2. Sequential codes are predictable.
+3. Codes get longer as the counter grows.
+
+
+For 1 billion URLs:
+
+1 billion in Base62 can fit in approximately 6 characters.
+
+62^6 is approximately 56 billion.
+
+At higher values, we eventually move to 7 characters.
+
+
+PREDICTABLE CODES:
+
+If codes are sequential:
+
+abc001
+abc002
+abc003
+
+An attacker could potentially enumerate them.
+
+Possible mitigation:
+Use an obfuscation/reversible transformation before Base62 encoding if
+predictability is considered a security concern.
+
+
+=============================================================
+12. WHY CACHE IS NEEDED
+=============================================================
+
+The system is extremely read-heavy.
+
+Without cache:
+
+GET /abc123
+    |
+    v
+Database
+    |
+    v
+Original URL
+    |
+    v
+302
+
+
+With Redis cache:
+
+GET /abc123
+    |
+    v
+Redis
+   / \
+ HIT  MISS
+  |     |
+  |     v
+  |   Database
+  |     |
+  |     v
+  |   Redis
+  |     |
+  \-----/
+      |
+      v
+     302
+
+
+CACHE KEY:
+
+short_code
+
+CACHE VALUE:
+
+original_url
+
+
+Example:
+
+key:
+abc123
+
+value:
+https://youtube.com/...
+
+
+This reduces database load and improves redirect latency.
+
+
+CACHE TTL:
+
+The cache TTL should be equal to or shorter than the URL expiration time.
+
+This helps prevent stale expired URLs from remaining in cache.
+
+
+=============================================================
+13. SCALING TO 1 BILLION URLS
+=============================================================
+
+Approximate storage calculation from the design:
+
+One URL mapping can be roughly 500 bytes after accounting for metadata.
+
+1 billion URLs:
+
+500 bytes x 1,000,000,000
+= approximately 500 GB
+
+
+This is manageable for modern storage.
+
+If the database eventually reaches a hardware/scaling limit, data can be
+sharded across multiple servers.
+
+
+=============================================================
+14. DATABASE CHOICE
+=============================================================
+
+Possible choices:
+
+- PostgreSQL
+- MySQL
+- DynamoDB
+- Other scalable databases
+
+
+Because the write rate is relatively low and caching handles many reads,
+many database technologies can work.
+
+PostgreSQL is a reasonable default, especially if you already know it.
+
+
+Example:
+
+Approximately 100,000 new URLs/day:
+
+100,000 / 86,400
+≈ 1 write per second
+
+
+So write throughput is relatively low compared with redirect traffic.
+
+
+=============================================================
+15. DATABASE HIGH AVAILABILITY
+=============================================================
+
+What if the database goes down?
+
+
+OPTION 1: DATABASE REPLICATION
+
+Maintain multiple copies:
+
+Primary DB
+   |
+   +---- Replica 1
+   |
+   +---- Replica 2
+
+
+If one server fails, another can be used.
+
+
+OPTION 2: DATABASE BACKUPS
+
+Take periodic database snapshots/backups and store them separately.
+
+
+Both approaches add operational complexity but improve reliability.
+
+
+=============================================================
+16. HORIZONTAL SCALING
+=============================================================
+
+Instead of one server:
+
+Client
+  |
+  v
+Server
+
+
+Use multiple servers:
+
+              Load Balancer
+              /     |     \
+             v      v      v
+          Server Server Server
+
+
+Horizontal scaling means adding more instances of a service.
+
+
+=============================================================
+17. READ SERVICE + WRITE SERVICE
+=============================================================
+
+Because reads are much more frequent than writes, separate them.
+
+READ SERVICE:
+- Handles GET /:short_code
+- Looks up URLs
+- Uses cache
+- Returns 302
+
+
+WRITE SERVICE:
+- Handles POST /urls
+- Generates short code
+- Saves URL
+- Uses global counter
+
+
+Architecture:
+
+                  API Gateway
+                  /         \
+                 v           v
+           Read Service   Write Service
+               |               |
+               v               v
+             Redis        Redis Counter
+               |               |
+               \               /
+                \             /
+                     Database
+
+
+This allows read and write services to scale independently.
+
+
+=============================================================
+18. GLOBAL COUNTER WITH MULTIPLE WRITE SERVERS
+=============================================================
+
+Problem:
+
+If multiple write servers generate counters independently:
+
+Server 1 -> 100
+Server 2 -> 100
+
+Collision!
+
+
+Solution:
+
+Use a centralized Redis counter.
+
+Write Server 1 ---\
+Write Server 2 ----> Redis
+Write Server 3 ---/
+
+
+Each calls:
+
+INCR url_counter
+
+
+Result:
+
+Server 1 -> 1000
+Server 2 -> 1001
+Server 3 -> 1002
+
+
+Because INCR is atomic, values are unique.
+
+
+=============================================================
+19. COUNTER BATCHING
+=============================================================
+
+Calling Redis for every URL creates an extra network request every time.
+
+Instead, request a batch.
+
+Example:
+
+Write Server asks Redis:
+
+"Give me 1000 counter values."
+
+Redis gives:
+
+1000 - 1999
+
+
+The server then locally uses:
+
+1000
+1001
+1002
+...
+1999
+
+
+When exhausted, it asks Redis for another batch.
+
+
+Advantages:
+
+- Fewer Redis network requests.
+- Lower Redis load.
+- Better performance.
+- Still maintains uniqueness.
+
+
+=============================================================
+20. REDIS HIGH AVAILABILITY
+=============================================================
+
+A single Redis instance can become a single point of failure.
+
+Possible approaches:
+
+- Redis Sentinel
+- Redis Cluster
+- Automatic failover
+
+
+These can improve counter-service availability.
+
+
+=============================================================
+21. MULTI-REGION DESIGN
+=============================================================
+
+For multiple regions, give each region a different counter range.
+
+Example:
+
+Region A:
+0 - 1 billion
+
+Region B:
+1 billion - 2 billion
+
+Region C:
+2 billion - 3 billion
+
+
+Then codes generated in different regions don't collide without
+cross-region counter coordination.
+
+
+Reads can be served through distributed/global caches.
+
+
+=============================================================
+22. REDIS FAILOVER
+=============================================================
+
+If Redis fails before the latest counter value is replicated, some counter
+values might be lost.
+
+That is acceptable because we need:
+
+UNIQUE VALUES
+
+We do NOT necessarily need:
+
+CONTINUOUS VALUES
+
+
+Example:
+
+1000
+1001
+1003
+1004
+
+Missing 1002 is okay.
+
+What matters is that we don't generate the same value for two URLs.
+
+The database UNIQUE constraint on short_code is an additional safety net.
+
+
+=============================================================
+23. FINAL ARCHITECTURE
+=============================================================
+
+Final design:
+
+                         CLIENT
+                            |
+                            v
+                       API GATEWAY
+                       /          \
+                      /            \
+                     v              v
+              READ SERVICE     WRITE SERVICE
+                   |                |
+                   v                v
+              REDIS CACHE      REDIS COUNTER
+                   |                |
+                   |              BASE62
+                   |                |
+                   \                /
+                    \              /
+                         DATABASE
+
+
+DATABASE:
+
+- short_code
+- original_url
+- creation_time
+- expiration_time
+- created_by
+
+
+REDIS CACHE:
+
+key:
+short_code
+
+value:
+original_url
+
+
+WRITE SERVICE:
+
+1. Validate URL
+2. Check custom alias
+3. Get unique counter
+4. Convert counter to Base62
+5. Store mapping in database
+6. Return short URL
+
+
+READ SERVICE:
+
+1. Receive short code
+2. Check Redis
+3. If cache HIT -> return 302
+4. If cache MISS -> query database
+5. Check expiration
+6. Put result into cache
+7. Return 302
+
+
+=============================================================
+24. CODE ARCHITECTURE FOR OUR PROJECT
+=============================================================
+
+Current project structure:
+
+Bitly/
+|
+├── controllers/
+|   └── urlControllers.js
+|
+├── db/
+|   └── database.js
+|
+├── repository/
+|   └── urlRepository.js
+|
+├── routes/
+|   └── urlRoutes.js
+|
+├── utils/
+|   └── base62.js
+|
+├── .env
+├── .gitignore
+├── package.json
+├── package-lock.json
+└── server.js
+
+
+We decided NOT to keep an empty service layer for the current version.
+
+Current request flow:
+
+Route
+  |
+  v
+Controller
+  |
+  v
+Repository
+  |
+  v
+PostgreSQL
+
+
+=============================================================
+25. RESPONSIBILITY OF EACH CODE LAYER
+=============================================================
+
+ROUTES:
+
+Only define endpoints.
+
+Example:
+
+router.post("/urls", createShortUrl);
+router.get("/:short_code", redirectToOriginalUrl);
+
+
+CONTROLLERS:
+
+Handle:
+- req.body
+- req.params
+- validation
+- business flow
+- HTTP status codes
+- responses
+
+
+REPOSITORY:
+
+Contains all database/SQL operations.
+
+Examples:
+
+INSERT
+SELECT
+UPDATE
+DELETE
+
+
+DATABASE:
+
+PostgreSQL connection/pool.
+
+
+UTILS:
+
+Reusable helper functions.
+
+Example:
+
+Base62 encoding.
+
+
+SERVER:
+
+Starts Express and registers routes.
+
+
+=============================================================
+26. RECOMMENDED CODE FLOW
+=============================================================
+
+CREATE:
+
+POST /urls
+    |
+    v
+urlRoutes.js
+    |
+    v
+urlControllers.js
+    |
+    v
+urlRepository.js
+    |
+    v
+PostgreSQL
+    |
+    v
+short URL response
+
+
+REDIRECT:
+
+GET /abc123
+    |
+    v
+urlRoutes.js
+    |
+    v
+urlControllers.js
+    |
+    v
+urlRepository.js
+    |
+    v
+PostgreSQL
+    |
+    v
+302 Redirect
+
+
+When Redis is added:
+
+GET /abc123
+    |
+    v
+Controller
+    |
+    v
+Redis
+   / \
+ HIT MISS
+  |    |
+  |    v
+  |  Repository
+  |    |
+  |    v
+  | PostgreSQL
+  |    |
+  \----/
+    |
+    v
+   302
+
+
+=============================================================
+27. CURRENT IMPLEMENTATION PLAN
+=============================================================
+
+Build in stages instead of trying to implement the complete distributed
+architecture at once.
+
+STAGE 1:
+
+Client
+  |
+Express
+  |
+PostgreSQL
+
+
+Implement:
+
+- POST /urls
+- GET /:short_code
+- Custom aliases
+- Expiration
+- 302 redirects
+- Base62 generation
+- Unique database constraint
+
+
+STAGE 2:
+
+Add Redis cache.
+
+Client
+  |
+Express
+  |
+Redis
+  |
+PostgreSQL
+
+
+Implement:
+
+- Cache lookup
+- Cache miss
+- Cache population
+- Cache TTL
+
+
+STAGE 3:
+
+Add Redis counter.
+
+Instead of:
+
+PostgreSQL ID
+    |
+    v
+Base62
+
+
+Use:
+
+Redis INCR
+    |
+    v
+Counter
+    |
+    v
+Base62
+    |
+    v
+Short code
+
+
+STAGE 4:
+
+Move toward the distributed system design:
+
+API Gateway
+    |
+    +---- Read Service
+    |
+    +---- Write Service
+             |
+             v
+        Redis Counter
+             |
+             v
+          Database
+
+
+STAGE 5:
+
+Production-level improvements:
+
+- Multiple application instances
+- Database replication
+- Redis Sentinel/Cluster
+- Counter batching
+- Multi-region counter ranges
+- Monitoring
+- Logging
+- Rate limiting
+- Security improvements
+
+
+=============================================================
+28. INTERVIEW ANSWER — 30 SECOND VERSION
+=============================================================
+
+"The system has two main operations: creating short URLs and redirecting
+users. For creation, the client sends POST /urls. The write service validates
+the URL, generates a globally unique short code using a counter and Base62,
+and stores the mapping in PostgreSQL. For redirection, the client sends
+GET /{short_code}. The read service first checks Redis and falls back to
+PostgreSQL on a cache miss, then returns a 302 redirect. Since the system is
+heavily read-oriented, we use caching and horizontally scale the read service.
+For high availability, we can use database replication, Redis failover, and
+multi-region counter ranges."
+
+
+=============================================================
+29. WHAT TO REMEMBER
+=============================================================
+
+Functional:
+
+CREATE
+    -> POST /urls
+
+REDIRECT
+    -> GET /:short_code
+
+
+Non-functional:
+
+UNIQUE
+    -> Every short code is unique
+
+FAST
+    -> Low-latency redirects
+
+AVAILABLE
+    -> High availability
+
+SCALABLE
+    -> 1B URLs + 100M DAU
+
+READ-HEAVY
+    -> Use cache
+
+
+Short code:
+
+Counter
+   |
+Base62
+   |
+Short code
+
+
+Fast reads:
+
+Redis
+   |
+Cache HIT
+   |
+302
+
+
+Database:
+
+short_code -> original_url
+
+
+Scaling:
+
+Load Balancer
+     |
+Multiple servers
+
+
+Large-scale:
+
+Read Service + Write Service
+
+
+Counter:
+
+Redis INCR
+
+
+High availability:
+
+DB Replication
++
+Redis Sentinel/Cluster
+
+
+Multi-region:
+
+Separate counter ranges
+
+
+=============================================================
+30. IMPORTANT MENTAL MODEL
+=============================================================
+
+Remember these four lines:
+
+WRITE:
+POST -> Write Service -> Counter -> Base62 -> DB
+
+READ:
+GET -> Read Service -> Redis -> DB if miss -> 302
+
+SCALE:
+Multiple Read/Write servers + Load Balancer
+
+UNIQUENESS:
+Atomic Counter + Base62 + DB UNIQUE constraint
+
+That is the core of the Bitly URL Shortener system design.

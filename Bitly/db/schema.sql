@@ -1,0 +1,6 @@
+CREATE TABLE IF NOT EXISTS urls (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    short_code TEXT UNIQUE,
+    original_url TEXT NOT NULL,
+    expiration_time TIMESTAMPTZ
+);
