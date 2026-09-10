@@ -1,0 +1,1814 @@
+DROPBOX-LIKE SYSTEM DESIGN + CODING NOTES
+===============================================
+
+Purpose
+-------
+These notes combine everything explained above about designing and coding a
+Dropbox-like cloud file storage system. They are organized so they can be
+used for system-design interview preparation and then implemented as a
+working project.
+
+============================================================
+1. WHAT IS DROPBOX?
+============================================================
+
+Dropbox is a cloud-based file storage service.
+
+Users can:
+- Store files in the cloud
+- Access files from different devices
+- Download files
+- Share files with other users
+- Automatically synchronize files across devices
+
+The important system-design idea is to separate:
+- File metadata/control operations
+from
+- Actual file data/storage
+
+============================================================
+2. FUNCTIONAL REQUIREMENTS
+============================================================
+
+Functional requirements describe WHAT the system should do.
+
+Core requirements:
+
+1. Upload
+   Users should be able to upload a file from any device.
+
+2. Download
+   Users should be able to download a file from any device.
+
+3. Share
+   Users should be able to share a file with other users and view files
+   shared with them.
+
+4. Sync
+   Files should automatically synchronize across devices.
+
+Memory trick:
+    U-D-S-S
+    Upload -> Download -> Share -> Sync
+
+Out of scope for the basic problem:
+- Editing files
+- Viewing files without downloading them
+
+
+============================================================
+3. NON-FUNCTIONAL REQUIREMENTS
+============================================================
+
+Non-functional requirements describe HOW WELL the system should work.
+
+1. High availability
+   The system should remain available even if some components fail.
+
+   For Dropbox, availability is prioritized over strong consistency.
+   A small replication delay can be acceptable. For example, a file uploaded
+   in one region may take a few seconds to appear in another region.
+
+2. Large files
+   The system should support files up to about 50 GB.
+
+3. Security and reliability
+   Files should be protected from unauthorized access.
+   The system should be able to recover from failures or corruption.
+
+4. Low latency
+   Uploads, downloads, and synchronization should be as fast as possible.
+
+Memory trick:
+    A-L-S-R
+    Availability
+    Large files
+    Security/Reliability
+    Low latency
+
+CAP idea:
+-----------
+Dropbox can prioritize availability over strong consistency because users
+can generally tolerate a short delay before a remote device sees a newly
+uploaded file.
+
+This is different from systems such as stock trading, where every read may
+need to reflect the latest transaction immediately.
+
+
+============================================================
+4. INTERVIEW APPROACH
+============================================================
+
+A simple sequence for product-style system-design questions is:
+
+    Requirements
+        |
+        v
+    Core Entities
+        |
+        v
+    APIs / System Interface
+        |
+        v
+    High-Level Design
+        |
+        v
+    Deep Dives
+        |
+        v
+    Trade-offs / Failure Handling
+
+For Dropbox, go through the functional requirements one by one:
+
+    1. Upload
+    2. Download
+    3. Share
+    4. Sync
+
+Then use the non-functional requirements to guide deeper design decisions.
+
+
+============================================================
+5. CORE ENTITIES
+============================================================
+
+Start with three simple entities.
+
+1. User
+   Represents the person using the system.
+
+   Example:
+       userId
+       name
+       email
+
+2. File
+   Represents the actual file/content.
+
+3. FileMetadata
+   Information about the file rather than the actual file bytes.
+
+   Example:
+       fileId
+       name
+       size
+       mimeType
+       uploadedBy
+       status
+       storage location
+       timestamps
+
+Important mental model:
+
+    File = actual data/saman
+
+    FileMetadata = information ABOUT the data
+
+For example:
+
+    Actual:
+        resume.pdf
+
+    Metadata:
+        fileId = 123
+        name = resume.pdf
+        size = 5 MB
+        mimeType = application/pdf
+        owner = user1
+
+
+============================================================
+6. DATABASE FOR FILE METADATA
+============================================================
+
+A NoSQL database such as DynamoDB can work because:
+- Metadata is relatively loosely structured.
+- There are few complex relationships.
+- A common query is fetching files by user.
+
+However, PostgreSQL or another SQL database can also work.
+
+Do not get stuck on choosing the perfect database in an interview.
+The important thing is understanding the access patterns and trade-offs.
+
+Example metadata document:
+
+{
+    "id": "123",
+    "name": "file.txt",
+    "size": 1000,
+    "mimeType": "text/plain",
+    "uploadedBy": "user1"
+}
+
+
+============================================================
+7. API / SYSTEM INTERFACE
+============================================================
+
+APIs are the interface between the client and backend.
+
+Initial simple APIs:
+
+UPLOAD
+-------
+POST /files
+
+Request:
+    File
+    FileMetadata
+
+
+DOWNLOAD
+--------
+GET /files/{fileId}
+
+Returns:
+    File
+    FileMetadata
+
+
+SHARE
+-----
+POST /files/{fileId}/share
+
+Request:
+{
+    "users": ["user2", "user3"]
+}
+
+
+SYNC / CHANGES
+--------------
+GET /files/changes?since={timestamp}
+
+Returns:
+    ChangeEvent[]
+
+A ChangeEvent can contain:
+- fileId
+- change type: created / updated / deleted
+- updated metadata
+
+The "since" timestamp lets a device ask:
+"What changed since my last synchronization?"
+
+Authentication information should normally be passed using a session token
+or JWT in the request headers.
+
+Example:
+
+    Authorization: Bearer <JWT>
+
+Do not blindly trust a userId supplied by the client in the request body.
+
+
+============================================================
+8. PHASE 1 PROJECT APIs
+============================================================
+
+For the first coding version, we will implement:
+
+AUTHENTICATION
+--------------
+POST   /api/auth/register
+POST   /api/auth/login
+
+
+FILES
+-----
+POST   /api/files
+GET    /api/files
+GET    /api/files/:fileId/download
+
+
+SHARING
+-------
+POST   /api/files/:fileId/share
+GET    /api/files/shared
+
+
+SYNC
+----
+GET    /api/files/changes?since=timestamp
+
+
+============================================================
+9. HIGH-LEVEL ARCHITECTURE
+============================================================
+
+Initial conceptual architecture:
+
+                 User Device
+                      |
+                      v
+            API Gateway / Load Balancer
+                      |
+                      v
+                 File Service
+                 /          \
+                v            v
+        Metadata Database    S3
+                             |
+                             v
+                       Actual Files
+
+For downloads:
+
+    User
+      |
+      v
+    API Gateway
+      |
+      v
+    File Service
+      |
+      v
+    Permission Check
+      |
+      v
+    CDN
+      |
+      v
+    S3
+      |
+      v
+    File
+
+
+============================================================
+10. API GATEWAY / LOAD BALANCER
+============================================================
+
+The API Gateway / Load Balancer sits in front of application services.
+
+Responsibilities can include:
+- Routing
+- Authentication
+- Rate limiting
+- SSL/TLS termination
+- Request validation
+- Distributing requests across servers
+
+It protects and organizes access to backend services.
+
+
+============================================================
+11. FILE SERVICE
+============================================================
+
+The File Service is the control-plane component.
+
+It is responsible for:
+- Reading/writing file metadata
+- Checking permissions
+- Generating pre-signed URLs
+- Coordinating uploads/downloads
+- Handling file-related APIs
+
+Important:
+
+The File Service should NOT carry the actual bytes of a huge file whenever
+we can avoid it.
+
+For large files:
+
+    Client ----------------------> S3
+              actual file bytes
+
+while:
+
+    Client -> File Service
+              metadata/control
+
+
+============================================================
+12. S3 / OBJECT STORAGE
+============================================================
+
+S3 stores the actual file data.
+
+Example:
+
+Metadata DB:
+    fileId = 123
+    name = resume.pdf
+    size = 2 GB
+    uploadedBy = user1
+    status = uploaded
+    s3Url = ...
+
+S3:
+    actual 2 GB resume.pdf
+
+Important distinction:
+
+    Metadata DB = information about the file
+    S3 = actual file bytes
+
+
+============================================================
+13. UPLOAD - BASIC FLOW
+============================================================
+
+A user wants to upload:
+
+    resume.pdf
+
+Simple conceptual flow:
+
+    Client
+       |
+       | "I want to upload"
+       v
+    File Service
+       |
+       | generate pre-signed URL
+       v
+    Client
+       |
+       | upload actual file
+       v
+    S3
+
+The client uploads directly to S3 instead of sending the entire file
+through the application server.
+
+
+============================================================
+14. PRE-SIGNED URL
+============================================================
+
+A pre-signed URL is a temporary URL that grants permission to perform a
+specific operation on a specific object.
+
+Conceptually:
+
+    Client
+       |
+       | Request upload
+       v
+    File Service
+       |
+       | Create signed URL
+       v
+    Client
+       |
+       | Direct upload
+       v
+    S3
+
+This avoids putting large file bytes through the backend.
+
+The File Service can generate the signature using its AWS credentials.
+Generating a pre-signed URL is a control-plane operation and does not mean
+the backend itself transfers the file.
+
+
+============================================================
+15. WHY ONE GIANT 50 GB POST IS A PROBLEM
+============================================================
+
+Uploading a 50 GB file through one request has several problems:
+
+1. Timeouts
+   A huge request can take a very long time.
+
+   Example:
+       50 GB at 100 Mbps
+       roughly 4000 seconds
+       roughly 1.11 hours
+
+2. Browser/server request limits
+   Gateways and servers may impose payload limits.
+
+3. Network interruptions
+   If the connection fails near the end, the entire transfer may need
+   to be restarted.
+
+4. Poor user experience
+   It is harder to show meaningful progress and resume work.
+
+Solution:
+
+    CHUNKING
+
+
+============================================================
+16. CHUNKING
+============================================================
+
+Instead of:
+
+    50 GB
+    [===========================]
+
+break the file into smaller pieces:
+
+    [5MB] [5MB] [5MB] [5MB] ...
+
+The exact chunk size can be adjusted according to network conditions and
+file size. A common conceptual range is around 5-10 MB.
+
+Very important:
+
+    The CLIENT should chunk the file.
+
+Do not first send the entire 50 GB to the backend and then ask the backend
+to split it. That would defeat the purpose.
+
+
+============================================================
+17. PROGRESS INDICATOR
+============================================================
+
+If a file contains 100 chunks and 30 are uploaded:
+
+    30 / 100
+
+The client can show:
+
+    Uploading: 30%
+
+This makes the upload experience much better.
+
+
+============================================================
+18. RESUMABLE UPLOADS
+============================================================
+
+Suppose:
+
+    Chunk 1   -> uploaded
+    Chunk 2   -> uploaded
+    ...
+    Chunk 70  -> uploaded
+    Chunk 71  -> failed
+    ...
+    Chunk 100 -> not uploaded
+
+If the network disconnects, the client should not restart from chunk 1.
+
+Instead:
+
+    Resume from chunk 71
+
+This is the main benefit of resumable uploads.
+
+
+============================================================
+19. TRACKING CHUNK STATUS
+============================================================
+
+FileMetadata can maintain upload state.
+
+Example:
+
+{
+    "id": "123",
+    "name": "file.txt",
+    "size": 1000,
+    "mimeType": "text/plain",
+    "uploadedBy": "user1",
+    "status": "uploading",
+    "chunks": [
+        {
+            "id": "chunk1",
+            "status": "uploaded"
+        },
+        {
+            "id": "chunk2",
+            "status": "uploading"
+        },
+        {
+            "id": "chunk3",
+            "status": "not-uploaded"
+        }
+    ]
+}
+
+When the client resumes, it can determine which chunks are already complete
+and only upload the missing ones.
+
+
+============================================================
+20. FINGERPRINT
+============================================================
+
+We should not identify a file only by its filename.
+
+Two files can both be named:
+
+    resume.pdf
+
+but have different content.
+
+A fingerprint is a hash derived from the file content.
+
+Example:
+
+    File
+      |
+      v
+    SHA-256
+      |
+      v
+    abc123...
+
+The fingerprint can help with:
+- Identifying the same content
+- Deduplication
+- Resumability
+
+Important:
+
+    fileId identifies the FILE RECORD.
+
+    fingerprint identifies the FILE CONTENT.
+
+Two users may have different fileIds but the same fingerprint if their
+files contain identical data.
+
+
+============================================================
+21. CHUNK FINGERPRINTS
+============================================================
+
+We can also fingerprint individual chunks:
+
+    File
+      |
+      +---- Chunk 1 -> hash1
+      +---- Chunk 2 -> hash2
+      +---- Chunk 3 -> hash3
+
+This helps identify exactly which chunks have already been transmitted.
+
+
+============================================================
+22. LARGE FILE MULTIPART UPLOAD FLOW
+============================================================
+
+Full flow:
+
+STEP 1:
+Client splits the file into chunks and calculates:
+- Full file fingerprint
+- Chunk fingerprints
+
+STEP 2:
+Client asks backend whether the same file/upload already exists.
+
+If an upload is already in progress:
+- Backend returns existing upload/chunk state
+- Client resumes missing chunks
+
+STEP 3:
+If it is a new upload:
+- Client calls backend
+- Backend calls S3 CreateMultipartUpload
+- S3 returns an uploadId
+- Backend generates pre-signed URLs for the parts
+- Backend stores metadata with status = uploading
+
+STEP 4:
+Client uploads each chunk directly to S3 using its pre-signed URL.
+
+Each part has:
+- uploadId
+- partNumber
+- corresponding pre-signed URL
+
+The backend can track the part and ETag.
+S3 ListParts can be used to verify the parts that exist.
+
+STEP 5:
+When all chunks are uploaded:
+- Backend calls CompleteMultipartUpload
+- S3 assembles the parts into one object
+- Only after successful completion does metadata become:
+
+    status = uploaded
+
+
+============================================================
+23. WHAT IS AN ETAG?
+============================================================
+
+For this design, think of an ETag as a value associated with an uploaded
+S3 part.
+
+Example:
+
+    Chunk 1 -> ETag A
+    Chunk 2 -> ETag B
+    Chunk 3 -> ETag C
+
+When completing the multipart upload, the part numbers and ETags are used
+to tell S3 which uploaded parts should be assembled.
+
+
+============================================================
+24. MULTIPART UPLOAD
+============================================================
+
+S3 provides Multipart Upload for large objects.
+
+Conceptually:
+
+    Client
+      |
+      +--> Part 1 --> S3
+      +--> Part 2 --> S3
+      +--> Part 3 --> S3
+      +--> ...
+      |
+      v
+    CompleteMultipartUpload
+      |
+      v
+    S3 assembles ONE final object
+
+This is a real-world cloud-storage pattern.
+
+
+============================================================
+25. DOWNLOAD
+============================================================
+
+Once a multipart upload is complete, S3 stores the result as a single object.
+
+Normal download can therefore be:
+
+    User
+      |
+      v
+    File Service
+      |
+      | permission check
+      v
+    Signed CDN URL
+      |
+      v
+    CDN
+      |
+      v
+    S3
+      |
+      v
+    User
+
+For very large downloads, HTTP Range Requests can allow downloading or
+resuming particular byte ranges.
+
+
+============================================================
+26. CDN
+============================================================
+
+CDN = Content Delivery Network.
+
+It caches frequently accessed content closer to users.
+
+Without CDN:
+
+    User in USA
+       |
+       v
+    S3 in another region
+
+With CDN:
+
+    User
+      |
+      v
+    Nearby CDN edge
+      |
+      v
+    S3
+
+
+CACHE MISS:
+    CDN does not have the file
+       |
+       v
+    CDN fetches from S3
+       |
+       v
+    CDN caches/serves the content
+
+
+CACHE HIT:
+    CDN already has the file
+       |
+       v
+    CDN serves it directly
+
+
+Benefits:
+- Lower download latency
+- Less load on S3
+- Faster access for frequently downloaded files
+
+
+============================================================
+27. SHARING
+============================================================
+
+Suppose user1 owns:
+
+    file123
+
+and wants to share it with user2.
+
+We can maintain a SharedFiles table.
+
+Example:
+
+    SharedFiles
+
+    userId     fileId
+    -----------------
+    user2      file123
+
+This means:
+
+    user2 has access to file123
+
+
+When user2 requests the file:
+
+    GET /files/file123
+
+File Service checks:
+
+    Does user2 have permission?
+
+If YES:
+    generate a download URL
+
+If NO:
+    return 403 Forbidden
+
+
+============================================================
+28. SHARING BY EMAIL
+============================================================
+
+The product can allow a user to enter another user's email address.
+
+The system can:
+- Find the target user
+- Create the sharing relationship
+- Store the permission mapping
+
+Authentication is assumed to already exist.
+
+
+============================================================
+29. SYNC
+============================================================
+
+A Dropbox-like system keeps:
+
+    Local copy on device
+             +
+    Remote copy in cloud
+
+There are two directions:
+
+    1. Local -> Remote
+    2. Remote -> Local
+
+
+============================================================
+30. LOCAL -> REMOTE SYNC
+============================================================
+
+A desktop/mobile sync agent monitors local files.
+
+Example:
+
+    Dropbox folder
+         |
+         v
+    Sync Agent
+         |
+         | detects change
+         v
+    Queue changed file/chunks
+         |
+         v
+    Upload API
+         |
+         v
+    S3
+
+On Windows, macOS, etc., OS-specific file-system events can be used to
+detect local changes.
+
+
+============================================================
+31. REMOTE -> LOCAL SYNC
+============================================================
+
+The other devices need to know when the cloud version changes.
+
+Two common approaches:
+
+A. POLLING
+-----------
+
+Client periodically asks:
+
+    GET /files/changes?since=timestamp
+
+Advantages:
+- Simple
+- Easy to reason about
+
+Disadvantages:
+- Can be slow to detect changes
+- Wastes requests if nothing changed
+
+
+B. WEBSOCKET / SSE
+------------------
+
+Server maintains a connection to the client and pushes notifications.
+
+Example:
+
+    Server
+       |
+       | "file123 changed"
+       v
+    WebSocket/SSE
+       |
+       v
+    Client
+
+Advantages:
+- Near-real-time notification
+
+Disadvantages:
+- More complex
+- Connections can drop
+
+
+============================================================
+32. HYBRID SYNC
+============================================================
+
+A practical design can combine both.
+
+1. WebSocket/SSE for active real-time notifications.
+2. Periodic polling as a reliability fallback.
+
+Example:
+
+    File changes
+         |
+         v
+    Server
+         |
+         v
+    WebSocket
+         |
+         v
+    Client gets immediate notification
+
+
+If WebSocket disconnects:
+
+    Client periodically calls:
+
+    GET /files/changes?since=timestamp
+
+This catches changes that may have been missed.
+
+Therefore:
+
+    WebSocket = speed
+    Polling = reliability/safety net
+
+
+============================================================
+33. LAST WRITE WINS
+============================================================
+
+If two devices modify the same file, a simple conflict strategy is:
+
+    Last Write Wins
+
+Example:
+
+    Laptop -> edit at 10:01
+    Phone  -> edit at 10:03
+
+The 10:03 edit becomes the latest saved version.
+
+More advanced versioning/conflict handling can be added later.
+
+Versioning is not part of the basic scope.
+
+
+============================================================
+34. DELTA SYNC
+============================================================
+
+If a very large file changes only slightly, we should avoid uploading the
+whole file again.
+
+Instead:
+
+    Original file
+         |
+         v
+    Identify changed chunks
+         |
+         v
+    Upload only changed chunks
+
+This can dramatically reduce sync bandwidth.
+
+
+============================================================
+35. CONTENT-DEFINED CHUNKING
+============================================================
+
+There is a subtle problem with fixed-size chunks.
+
+Suppose:
+
+    [A][B][C][D][E]
+
+If one byte is inserted near the beginning, fixed-size boundaries may shift:
+
+    [A'][B'][C'][D'][E']
+
+The system may now think many chunks changed even though only a small part
+of the file changed.
+
+Content-Defined Chunking (CDC) chooses boundaries based on the file content.
+
+Conceptually:
+
+    Before:
+        [A][B][C][D][E]
+
+    Small edit:
+
+        [A*][B][C][D][E]
+
+Most chunks can remain reusable.
+
+This makes delta synchronization much more efficient.
+
+
+============================================================
+36. PARALLEL UPLOADS
+============================================================
+
+Instead of:
+
+    Chunk 1 -> Chunk 2 -> Chunk 3 -> Chunk 4
+
+we can upload multiple chunks at the same time:
+
+    Chunk 1 ----\
+    Chunk 2 -----\
+    Chunk 3 ------> S3
+    Chunk 4 -----/
+    Chunk 5 ----/
+
+This can make better use of available network bandwidth.
+
+Chunk size can also be adapted based on network conditions.
+
+
+============================================================
+37. COMPRESSION
+============================================================
+
+Compression can reduce the amount of data transferred.
+
+Conceptually:
+
+    Original
+       |
+       v
+    Compress
+       |
+       v
+    Smaller data
+       |
+       v
+    Upload
+
+Compression can be useful for highly compressible data such as text.
+
+It may provide little benefit for already-compressed formats such as many
+images/videos.
+
+The client can decide whether compression is worthwhile based on:
+- File type
+- File size
+- Network conditions
+- CPU cost
+
+
+Common algorithms:
+- Gzip
+- Brotli
+- Zstandard
+
+For a client-side system, Zstandard can offer a strong speed/compression
+trade-off, depending on supported environments.
+
+Important:
+If both compression and encryption are required, compression should
+generally happen before encryption because encrypted data is much harder
+to compress effectively.
+
+
+============================================================
+38. SECURITY
+============================================================
+
+Three major security ideas:
+
+1. Encryption in transit
+2. Encryption at rest
+3. Access control
+
+
+A. ENCRYPTION IN TRANSIT
+------------------------
+
+Use HTTPS/TLS.
+
+    Client <==== encrypted connection ====> Server/S3
+
+
+B. ENCRYPTION AT REST
+---------------------
+
+Encrypt files while stored in S3.
+
+    S3
+      |
+      v
+    Encrypted file
+
+
+C. ACCESS CONTROL
+------------------
+
+The sharing/ACL information determines who can access a file.
+
+Example:
+
+    file123
+       |
+       +-- user1 -> allowed
+       +-- user2 -> allowed
+       +-- user3 -> denied
+
+
+============================================================
+39. SIGNED DOWNLOAD URL
+============================================================
+
+Suppose user2 is authorized to download a file.
+
+File Service generates a short-lived signed URL.
+
+Example:
+
+    Valid for 5 minutes
+
+Then:
+
+    User
+      |
+      v
+    Signed URL
+      |
+      v
+    CDN/S3
+      |
+      v
+    File
+
+After expiration:
+
+    Signed URL -> invalid
+
+
+Important security concept:
+
+A signed URL is a bearer token.
+
+Anyone who possesses a valid, unexpired URL may be able to use it.
+
+Short expiration reduces exposure but does not completely prevent sharing.
+
+
+============================================================
+40. SIGNED URL FLOW
+============================================================
+
+1. Generation
+   Server generates a signed URL containing a signature and expiration.
+
+2. Distribution
+   URL is returned to the authorized client.
+
+3. Validation
+   CDN/S3 verifies:
+   - Signature
+   - Expiration
+   - Any configured restrictions
+
+4. Access
+   Valid request receives the file.
+   Invalid/expired request is rejected.
+
+
+============================================================
+41. FINAL ARCHITECTURE
+============================================================
+
+                         USER DEVICE
+                              |
+                              v
+                 API Gateway / Load Balancer
+                              |
+                              v
+                       File Service
+                       /          \
+                      v            v
+             Metadata DB      Presigned URLs
+                                   |
+                                   v
+                                  S3
+                                   |
+                          Actual File Storage
+                                   |
+                                   v
+                                  CDN
+                                   |
+                                   v
+                                Users
+
+
+UPLOAD:
+    Client
+      |
+      | metadata/control
+      v
+    File Service
+      |
+      | presigned URL
+      v
+    Client
+      |
+      | actual bytes
+      v
+    S3
+
+
+DOWNLOAD:
+    Client
+      |
+      v
+    File Service
+      |
+      | permission check
+      v
+    Signed CDN URL
+      |
+      v
+    CDN
+      |
+      v
+    S3
+      |
+      v
+    Client
+
+
+SYNC:
+    Local File
+       |
+       v
+    Sync Agent
+       |
+       v
+    Changed chunks
+       |
+       v
+    S3
+
+    Remote change
+       |
+       v
+    WebSocket/SSE
+       |
+       v
+    Other devices
+
+    Polling is the fallback.
+
+
+============================================================
+42. CONTROL PLANE VS DATA PLANE
+============================================================
+
+This is a very useful interview concept.
+
+CONTROL PLANE:
+    Client
+       |
+       v
+    API Gateway
+       |
+       v
+    File Service
+       |
+       +--> Metadata DB
+       |
+       +--> Generate presigned URLs
+       |
+       +--> Permission checks
+
+DATA PLANE:
+    Client
+       |
+       | actual file bytes
+       v
+    S3
+
+The key idea:
+
+    File Service controls the operation.
+
+    S3 carries/stores the large data.
+
+
+============================================================
+43. FINAL METADATA MODEL
+============================================================
+
+A conceptual FileMetadata structure can contain:
+
+    fileId
+    name
+    size
+    mimeType
+    uploadedBy
+    status
+    s3Url / storage reference
+    fingerprint
+    chunks
+    createdAt
+    updatedAt
+
+A chunk can contain:
+
+    chunkId
+    partNumber
+    status
+    ETag
+    fingerprint
+
+
+============================================================
+44. CODING THE PROJECT
+============================================================
+
+We will build the system incrementally.
+
+Recommended stack:
+
+    Frontend:
+        React
+
+    Backend:
+        Node.js + Express
+
+    Database:
+        PostgreSQL
+
+    Authentication:
+        JWT
+
+    Initial storage:
+        Local file storage
+
+    Later:
+        AWS S3
+
+
+WHY START WITH LOCAL STORAGE?
+-----------------------------
+
+It lets us understand the application architecture first.
+
+Phase 1:
+
+    React
+      |
+      v
+    Express API
+      |
+      +----> PostgreSQL
+      |
+      +----> local uploads/
+
+
+Then we replace local storage with S3.
+
+Final architecture:
+
+    React
+      |
+      v
+    Express / File Service
+      |
+      +----> PostgreSQL
+      |
+      +----> generate presigned URL
+                    |
+                    v
+                   S3
+
+
+============================================================
+45. PHASE 1 DATABASE
+============================================================
+
+USERS
+-----
+
+    id
+    name
+    email
+    password
+
+
+FILES
+-----
+
+    id
+    name
+    size
+    mime_type
+    uploaded_by
+    storage_path
+    status
+    created_at
+    updated_at
+
+
+SHARED_FILES
+------------
+
+    user_id
+    file_id
+
+
+Conceptually:
+
+    users
+      |
+      | uploaded_by
+      v
+    files
+      |
+      v
+    shared_files
+      |
+      v
+    other users
+
+
+============================================================
+46. PHASE 1 API LIST
+============================================================
+
+AUTH:
+
+    POST /api/auth/register
+    POST /api/auth/login
+
+
+UPLOAD / FILES:
+
+    POST /api/files
+    GET /api/files
+    GET /api/files/:fileId/download
+
+
+SHARING:
+
+    POST /api/files/:fileId/share
+    GET /api/files/shared
+
+
+SYNC:
+
+    GET /api/files/changes?since=timestamp
+
+
+============================================================
+47. IMPLEMENTATION ROADMAP
+============================================================
+
+PHASE 1:
+    Authentication
+    Upload
+    Download
+    List files
+    Share files
+
+PHASE 2:
+    Replace local storage with S3
+    Pre-signed upload URLs
+    Pre-signed download URLs
+
+PHASE 3:
+    Large-file support
+    Client-side chunking
+    Resumable uploads
+    S3 Multipart Upload
+    Upload progress
+
+PHASE 4:
+    Synchronization
+    Change events
+    WebSocket/SSE
+    Polling fallback
+
+PHASE 5:
+    CDN
+    Signed CDN URLs
+    Caching
+
+PHASE 6:
+    Security
+    HTTPS
+    Encryption
+    Permissions
+    Rate limiting
+
+PHASE 7:
+    Advanced optimization
+    Fingerprinting
+    Deduplication
+    Parallel uploads
+    Delta sync
+    Content-Defined Chunking
+    Compression
+    Failure handling
+
+
+============================================================
+48. INTERVIEW EXPECTATIONS
+============================================================
+
+MID-LEVEL / E4
+--------------
+
+Main focus:
+    Breadth > Depth
+
+Approximate focus:
+    80% breadth
+    20% depth
+
+You should be able to:
+- Define requirements
+- Define entities
+- Define APIs
+- Build a high-level architecture
+- Explain what basic components do
+- Cover upload, download, and sharing
+
+You do NOT necessarily need to know every advanced technology immediately.
+
+For example, you may initially design:
+
+    Client -> API Server -> Storage
+
+Then reason toward better solutions when the interviewer asks:
+
+    "You're uploading the file twice. How can you avoid that?"
+
+or:
+
+    "How do you show progress and resume a failed upload?"
+
+The important skill is reasoning toward:
+- Direct storage upload
+- Pre-signed URLs
+- Chunking
+- Resumability
+
+
+SENIOR / E5
+-----------
+
+Approximate focus:
+    60% breadth
+    40% depth
+
+Expected:
+- Strong high-level architecture
+- Blob/object storage knowledge
+- CDN knowledge
+- Large-file upload design
+- Trade-offs
+- Scalability
+- Performance
+- Reliability
+- More proactive identification of problems
+
+For Dropbox, a senior candidate should proactively think about
+large-file handling and can discuss multipart upload and how it works.
+
+
+STAFF+
+------
+
+Approximate focus:
+    40% breadth
+    60% depth
+
+Expected:
+- Deep distributed-system knowledge
+- Real-world technology choices
+- Scalability
+- Reliability
+- Caching
+- Load balancing
+- Failure handling
+- Security
+- Operational concerns
+- Detailed trade-offs
+- Proactive architecture decisions
+
+The candidate should be able to explain not only WHAT technology is used,
+but WHY it is appropriate and what trade-offs it creates.
+
+
+============================================================
+49. THREE LEVELS TO REMEMBER
+============================================================
+
+MID-LEVEL:
+
+    "Can you build it?"
+
+    Requirements
+        ↓
+    APIs
+        ↓
+    DB
+        ↓
+    Storage
+        ↓
+    Working system
+
+
+SENIOR:
+
+    "Can you build it and handle the hard problems?"
+
+    Working system
+        ↓
+    Large files
+        ↓
+    Chunking
+        ↓
+    Resumability
+        ↓
+    Multipart upload
+        ↓
+    CDN
+        ↓
+    Sync
+
+
+STAFF+:
+
+    "Can you design it like a real distributed system?"
+
+    Architecture
+        ↓
+    Scalability
+        ↓
+    Reliability
+        ↓
+    Performance
+        ↓
+    Security
+        ↓
+    Failure scenarios
+        ↓
+    Trade-offs
+        ↓
+    Operational concerns
+
+
+============================================================
+50. 30-SECOND INTERVIEW ANSWER
+============================================================
+
+"For large files, I would chunk the file on the client and use S3
+Multipart Upload. The backend generates pre-signed URLs, so the actual
+file data goes directly from the client to S3 rather than through our
+application servers. We track chunk status so uploads can be resumed
+after failures. We use fingerprints to identify files and chunks. For
+fast downloads, we use a CDN with short-lived signed URLs. For sync, we
+upload only changed chunks and notify other devices through WebSockets or
+SSE, with periodic polling as a reliability fallback."
+
+
+============================================================
+51. MOST IMPORTANT THINGS TO REMEMBER
+============================================================
+
+1. Functional:
+       Upload
+       Download
+       Share
+       Sync
+
+2. Non-functional:
+       Availability
+       Large files
+       Security/Reliability
+       Low latency
+
+3. Metadata DB:
+       Stores information ABOUT files.
+
+4. S3:
+       Stores actual file bytes.
+
+5. File Service:
+       Metadata + permissions + URL generation/control plane.
+
+6. Pre-signed URL:
+       Lets client access S3 directly for a limited operation/time.
+
+7. Chunking:
+       Breaks large files into smaller pieces.
+
+8. Resumable upload:
+       Upload only missing chunks after failure.
+
+9. Multipart upload:
+       S3 mechanism for assembling uploaded parts.
+
+10. CDN:
+       Makes downloads faster by serving cached content near users.
+
+11. SharedFiles:
+       Controls which users have access to which files.
+
+12. WebSocket/SSE:
+       Fast remote-change notifications.
+
+13. Polling:
+       Reliability fallback for missed notifications.
+
+14. Fingerprint:
+       Identifies file content.
+
+15. Delta sync:
+       Upload only changed portions.
+
+16. CDC:
+       Makes delta sync more efficient after small edits.
+
+17. Security:
+       HTTPS + encryption at rest + access control + signed URLs.
+
+18. Architecture principle:
+       Keep large file bytes out of the application server whenever
+       possible.
+
+19. Control plane:
+       File Service + metadata + permissions + signed URLs.
+
+20. Data plane:
+       Client <-> S3/CDN for actual file data.
+
+
+============================================================
+END
+============================================================
